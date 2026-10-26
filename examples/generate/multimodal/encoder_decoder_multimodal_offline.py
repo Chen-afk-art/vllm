@@ -11,6 +11,7 @@ from typing import NamedTuple
 
 from vllm import LLM, EngineArgs, PromptType, SamplingParams
 from vllm.assets.audio import AudioAsset
+from vllm.assets.image import ImageAsset
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 
@@ -93,8 +94,49 @@ def run_fireredasr2():
     )
 
 
+def run_t5gemma2():
+    """T5Gemma 2 – encoder-decoder model with text and image inputs.
+
+    The prompt (and its images) is fed to the encoder; the decoder starts
+    from `<bos>` unless an explicit decoder prompt is given.
+    """
+    engine_args = EngineArgs(
+        model="google/t5gemma-2-270m-270m",
+        max_model_len=2048,
+        max_num_seqs=16,
+        limit_mm_per_prompt={"image": 1},
+    )
+
+    prompts = [
+        {  # Text-only prompt
+            "prompt": "Translate English to French: Where is the train station?",
+        },
+        {  # Image prompt
+            "prompt": "<start_of_image> in this image, there is",
+            "multi_modal_data": {
+                "image": ImageAsset("stop_sign").pil_image.convert("RGB"),
+            },
+        },
+        {  # Explicit encoder/decoder prompt
+            "encoder_prompt": {
+                "prompt": "<start_of_image> describe the picture.",
+                "multi_modal_data": {
+                    "image": ImageAsset("cherry_blossom").pil_image.convert("RGB"),
+                },
+            },
+            "decoder_prompt": "The picture shows",
+        },
+    ]
+
+    return ModelRequestData(
+        engine_args=engine_args,
+        prompts=prompts,
+    )
+
+
 model_example_map = {
     "fireredasr2": run_fireredasr2,
+    "t5gemma2": run_t5gemma2,
     "whisper": run_whisper,
 }
 

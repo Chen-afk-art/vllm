@@ -649,6 +649,10 @@ _MULTIMODAL_MODELS = {
         "nemotron_parse3_5",
         "RadioMBartPrefixForCausalLM",
     ),
+    "T5Gemma2ForConditionalGeneration": (
+        "t5gemma2",
+        "T5Gemma2ForConditionalGeneration",
+    ),
     "WhisperForConditionalGeneration": ("whisper", "WhisperForConditionalGeneration"),
 }
 

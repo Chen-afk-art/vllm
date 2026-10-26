@@ -1489,6 +1489,10 @@ _MULTIMODAL_EXAMPLE_MODELS = {
         extras={"2.0": "nvidia/NVIDIA-Nemotron-Parse-2.0"},
         trust_remote_code=True,
     ),
+    "T5Gemma2ForConditionalGeneration": _HfExamplesInfo(
+        "google/t5gemma-2-270m-270m",
+        extras={"1b": "google/t5gemma-2-1b-1b", "4b": "google/t5gemma-2-4b-4b"},
+    ),
     "WhisperForConditionalGeneration": _HfExamplesInfo(
         "openai/whisper-large-v3-turbo",
         extras={"v3": "openai/whisper-large-v3"},

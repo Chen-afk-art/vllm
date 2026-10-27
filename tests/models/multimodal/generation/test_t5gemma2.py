@@ -1,13 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
 import torch
+from peft import LoraConfig, get_peft_model
 from transformers import AutoModelForSeq2SeqLM
 
 from tests.models.utils import check_logprobs_close
 from vllm.assets.image import ImageAsset
+from vllm.lora.request import LoRARequest
 from vllm.model_executor.models.t5gemma2 import (
     _paged_attention_with_lse_torch,
     _write_kv_cache_torch,
@@ -165,4 +168,63 @@ def test_image(hf_runner, vllm_runner, dtype: str, num_logprobs: int) -> None:
         dtype=dtype,
         max_tokens=32,
         num_logprobs=num_logprobs,
+    )
+
+
+@pytest.mark.core_model
+@pytest.mark.parametrize("dtype", ["bfloat16"])
+@pytest.mark.parametrize("num_logprobs", [5])
+def test_lora(hf_runner, vllm_runner, tmp_path, dtype: str, num_logprobs: int) -> None:
+    """LoRA on the text encoder and decoder must match HF + PEFT, also for a
+    request without the adapter in the same batch."""
+    prompts = [TEXT_PROMPTS[0], TEXT_PROMPTS[0], TEXT_PROMPTS[1]]
+    use_lora = [True, False, True]
+    lora_path = str(tmp_path / "lora")
+    max_tokens = 32
+
+    with hf_runner(MODEL, dtype=dtype, auto_cls=AutoModelForSeq2SeqLM) as hf_model:
+        # A random adapter on every text projection; PEFT initializes B to 0.
+        target = (
+            r"model\.(encoder\.text_model|decoder)\.layers\.\d+\."
+            r"(self_attn\.[qkvo]_proj|mlp\.(gate|up|down)_proj)"
+        )
+        peft_model = get_peft_model(
+            hf_model.model, LoraConfig(r=8, lora_alpha=16, target_modules=target)
+        )
+        torch.manual_seed(0)
+        for name, param in peft_model.named_parameters():
+            if "lora_" in name:
+                param.data.normal_(0.0, 0.03)
+        peft_model.save_pretrained(lora_path)
+
+        hf_model.model = peft_model
+        hf_outputs = []
+        for prompt, lora in zip(prompts, use_lora):
+            with nullcontext() if lora else peft_model.disable_adapter():
+                hf_outputs += hf_model.generate_greedy_logprobs_limit(
+                    [prompt], max_tokens, num_logprobs=num_logprobs
+                )
+    assert hf_outputs[0][0] != hf_outputs[1][0], "the adapter has no effect"
+
+    lora_request = LoRARequest("random", 1, lora_path)
+    with vllm_runner(
+        MODEL,
+        dtype=dtype,
+        max_model_len=2048,
+        limit_mm_per_prompt={"image": 0},
+        enable_lora=True,
+        max_lora_rank=8,
+    ) as vllm_model:
+        vllm_outputs = vllm_model.generate_greedy_logprobs(
+            prompts,
+            max_tokens,
+            num_logprobs=num_logprobs,
+            lora_request=[lora_request if lora else None for lora in use_lora],
+        )
+
+    check_logprobs_close(
+        outputs_0_lst=hf_outputs,
+        outputs_1_lst=vllm_outputs,
+        name_0="hf",
+        name_1="vllm",
     )

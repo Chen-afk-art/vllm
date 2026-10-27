@@ -162,6 +162,13 @@ class T5Gemma2ForConditionalGenerationConfig(VerifyAndUpdateConfig):
     def verify_and_update_config(vllm_config: "VllmConfig") -> None:
         from vllm.platforms import current_platform
 
+        lora_config = vllm_config.lora_config
+        if lora_config is not None and not lora_config.enable_tower_connector_lora:
+            # The text encoder runs on the multimodal encoder path, which only
+            # applies LoRA to tower modules when this is enabled.
+            logger.info("Enabling `enable_tower_connector_lora` for T5Gemma2 LoRA.")
+            lora_config.enable_tower_connector_lora = True
+
         model_config = vllm_config.model_config
         if not current_platform.is_cuda() or model_config.enforce_eager:
             return

@@ -644,7 +644,7 @@ These models primarily accept the [`LLM.generate`](./generative_models.md#llmgen
 | `StepVLForConditionalGeneration` | Step3-VL-10B | T + I<sup>+</sup> | `stepfun-ai/Step3-VL-10B` | | ✅︎ |
 | `Step3p7ForConditionalGeneration` | Step-3.7-Flash | T + I<sup>+</sup> | `stepfun-ai/Step-3.7-Flash` | | ✅︎ |
 | `Step5ForConditionalGeneration` | Step-5-Preview | T + I<sup>+</sup> | `stepfun-ai/Step-5-Preview`, etc. | ✅︎ | ✅︎ |
-| `T5Gemma2ForConditionalGeneration` | T5Gemma 2 (encoder-decoder) | T + I<sup>+</sup> | `google/t5gemma-2-270m-270m`, `google/t5gemma-2-1b-1b`, `google/t5gemma-2-4b-4b` | | |
+| `T5Gemma2ForConditionalGeneration` | T5Gemma 2 (encoder-decoder) | T + I<sup>+</sup> | `google/t5gemma-2-270m-270m`, `google/t5gemma-2-1b-1b`, `google/t5gemma-2-4b-4b` | ✅︎ | |
 | `UltravoxModel` | Ultravox | T + A<sup>E+</sup> | `fixie-ai/ultravox-v0_5-llama-3_2-1b` | ✅︎ | ✅︎ |
 | `UnlimitedOCRForCausalLM` | Unlimited-OCR | T + I<sup>+</sup> | `baidu/Unlimited-OCR`, etc. | ✅︎ | ✅︎ |
 
@@ -728,6 +728,12 @@ Some models are supported only via the [Transformers modeling backend](#transfor
     Audio inputs are only supported by the Omni variants; `NemotronH_Nano_VL_V2`
     checkpoints such as `nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16` accept text,
     image and video only.
+
+!!! note
+    For `T5Gemma2ForConditionalGeneration`, LoRA adapters apply to the text encoder
+    and the decoder; LoRA weights of the vision tower are ignored. vLLM turns on
+    `enable_tower_connector_lora` automatically, because the text encoder runs on
+    the multimodal encoder path.
 
 !!! note
     The official `openbmb/MiniCPM-V-2` doesn't work yet, so we need to use a fork (`HwwwH/MiniCPM-V-2`) for now.

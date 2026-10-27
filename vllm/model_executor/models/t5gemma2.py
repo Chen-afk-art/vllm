@@ -33,11 +33,18 @@ Merged attention is computed as two partial attentions, one over the decoder
 self-attention KV cache and one over the cross-attention KV cache. Merging
 them by their log-sum-exp (LSE) is exactly one softmax over the union of both
 key sets.
+
+LoRA covers the text encoder and the decoder, but not the vision tower. The
+text encoder runs on the batch of encoder tokens, whose adapter mapping vLLM
+only builds for multimodal "tower" modules, so it is registered as the tower.
+The decoder projects the encoder outputs into cross-attention K/V with that
+same per-encoder-token mapping.
 """
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import regex as re
@@ -57,6 +64,7 @@ from vllm.config.multimodal import MultiModalDummyOptions
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
 from vllm.inputs import MultiModalDataDict, MultiModalEncDecInput, MultiModalInput
+from vllm.lora.layers.base import BaseLayerWithLoRA
 from vllm.model_executor.layers.attention import Attention, CrossAttention
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.layers.linear import QKVParallelLinear, RowParallelLinear
@@ -97,9 +105,13 @@ from .gemma3_mm import (
     Gemma3MultiModalProjector,
     Gemma3ProcessingInfo,
 )
-from .interfaces import MultiModalEmbeddings, SupportsMultiModal
+from .interfaces import MultiModalEmbeddings, SupportsLoRA, SupportsMultiModal
+from .module_mapping import MultiModelKeys
 from .siglip import SiglipVisionModel
 from .utils import AutoWeightsLoader, WeightsMapper, extract_layer_index, maybe_prefix
+
+if TYPE_CHECKING:
+    from vllm.lora.punica_wrapper import PunicaWrapperBase
 
 # The encoder input of one request (its token IDs and all of its images) is
 # packed into one multimodal item of this modality, which users never pass
@@ -109,6 +121,9 @@ from .utils import AutoWeightsLoader, WeightsMapper, extract_layer_index, maybe_
 _ENCODER_MODALITY = "text"
 _ENCODER_INPUT_IDS = "encoder_input_ids"
 _PIXEL_VALUES = "pixel_values"
+
+_LORA_DECODER_PREFIX = "model.decoder"
+_LORA_ENCODER_PREFIX = "model.encoder.text_model"
 
 
 # --------------------------------------------------------------------------- #
@@ -651,6 +666,22 @@ def t5gemma2_merged_attention(
     merge_attn_states(output[:num_tokens], self_out, self_lse, cross_out, cross_lse)
 
 
+@contextmanager
+def _lora_mapping(
+    layer: nn.Module, punica_wrapper: "PunicaWrapperBase | None"
+) -> Iterator[None]:
+    """Run a LoRA layer with another token-to-adapter mapping."""
+    if punica_wrapper is None or not isinstance(layer, BaseLayerWithLoRA):
+        yield
+        return
+    original = layer.punica_wrapper
+    layer.set_mapping(punica_wrapper)
+    try:
+        yield
+    finally:
+        layer.set_mapping(original)
+
+
 # --------------------------------------------------------------------------- #
 # Model
 # --------------------------------------------------------------------------- #
@@ -857,13 +888,15 @@ class T5Gemma2MergedAttention(T5Gemma2AttentionBase):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor | None,
+        encoder_lora_mapping: "PunicaWrapperBase | None",
     ) -> torch.Tensor:
         q, k, v = self.project_qkv(positions, hidden_states)
 
         cross_k = cross_v = None
         if encoder_hidden_states is not None:
             # The encoder K/V reuse k_proj/v_proj and k_norm, without RoPE.
-            qkv, _ = self.qkv_proj(encoder_hidden_states)
+            with _lora_mapping(self.qkv_proj, encoder_lora_mapping):
+                qkv, _ = self.qkv_proj(encoder_hidden_states)
             _, cross_k, cross_v = qkv.split(
                 [self.q_size, self.kv_size, self.kv_size], dim=-1
             )
@@ -960,6 +993,7 @@ class T5Gemma2DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
         encoder_hidden_states: torch.Tensor | None,
+        encoder_lora_mapping: "PunicaWrapperBase | None",
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # `norm(x, residual)` fuses the residual add: it returns
         # (norm(x + residual), x + residual).
@@ -970,7 +1004,9 @@ class T5Gemma2DecoderLayer(nn.Module):
             hidden_states, residual = self.pre_self_attn_layernorm(
                 hidden_states, residual
             )
-        hidden_states = self.self_attn(positions, hidden_states, encoder_hidden_states)
+        hidden_states = self.self_attn(
+            positions, hidden_states, encoder_hidden_states, encoder_lora_mapping
+        )
         hidden_states = self.post_self_attn_layernorm(hidden_states)
 
         hidden_states, residual = self.pre_feedforward_layernorm(
@@ -1116,12 +1152,17 @@ class T5Gemma2Decoder(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         encoder_hidden_states: torch.Tensor | None = None,
+        encoder_lora_mapping: "PunicaWrapperBase | None" = None,
     ) -> torch.Tensor:
         hidden_states = self.embed_input_ids(input_ids)
         residual = None
         for layer in self.layers:
             hidden_states, residual = layer(
-                positions, hidden_states, residual, encoder_hidden_states
+                positions,
+                hidden_states,
+                residual,
+                encoder_hidden_states,
+                encoder_lora_mapping,
             )
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
@@ -1151,7 +1192,11 @@ class T5Gemma2Model(nn.Module):
     info=T5Gemma2ProcessingInfo,
     dummy_inputs=T5Gemma2DummyInputsBuilder,
 )
-class T5Gemma2ForConditionalGeneration(nn.Module, SupportsMultiModal):
+class T5Gemma2ForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsLoRA):
+    # Required for LoRA on the text encoder (see the module docstring), so
+    # `T5Gemma2ForConditionalGenerationConfig` enables it with LoRA.
+    supports_tower_connector_lora = True
+
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
@@ -1262,6 +1307,22 @@ class T5Gemma2ForConditionalGeneration(nn.Module, SupportsMultiModal):
         assert isinstance(pixel_values, torch.Tensor)
         return self.model.encoder(encoder_input_ids, pixel_values)
 
+    def get_mm_mapping(self) -> MultiModelKeys:
+        return MultiModelKeys.from_string_field(
+            language_model=_LORA_DECODER_PREFIX,
+            tower_model=_LORA_ENCODER_PREFIX,
+        )
+
+    def get_mm_lora_token_counts(
+        self,
+        *,
+        modality: str,
+        mm_kwargs: MultiModalKwargsItem | None,
+        num_mm_embeds: int,
+    ) -> tuple[int, int | None]:
+        # The text encoder runs on every token of the packed encoder item.
+        return num_mm_embeds, None
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -1273,8 +1334,20 @@ class T5Gemma2ForConditionalGeneration(nn.Module, SupportsMultiModal):
     ) -> torch.Tensor:
         # Encoder outputs are only passed in the first decoder step of each
         # request; afterwards their K/V live in the cross-attention cache.
-        encoder_hidden_states = torch.cat(encoder_outputs) if encoder_outputs else None
-        return self.model.decoder(input_ids, positions, encoder_hidden_states)
+        encoder_hidden_states = None
+        encoder_lora_mapping = None
+        if encoder_outputs:
+            encoder_hidden_states = torch.cat(encoder_outputs)
+            # The model runner maps these tokens, in this order, to their
+            # adapters when it runs the encoder in the same step.
+            lora_manager = getattr(self, "lora_manager", None)
+            if lora_manager is not None:
+                encoder_lora_mapping = lora_manager.punica_wrapper_mapping[
+                    _LORA_ENCODER_PREFIX
+                ]
+        return self.model.decoder(
+            input_ids, positions, encoder_hidden_states, encoder_lora_mapping
+        )
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)

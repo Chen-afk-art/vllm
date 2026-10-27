@@ -157,6 +157,28 @@ class Gemma3TextModelConfig(VerifyAndUpdateConfig):
         hf_config.is_causal = not hf_config.use_bidirectional_attention
 
 
+class T5Gemma2ForConditionalGenerationConfig(VerifyAndUpdateConfig):
+    @staticmethod
+    def verify_and_update_config(vllm_config: "VllmConfig") -> None:
+        from vllm.platforms import current_platform
+
+        model_config = vllm_config.model_config
+        if not current_platform.is_cuda() or model_config.enforce_eager:
+            return
+
+        from vllm.v1.attention.backends.fa_utils import get_flash_attn_version
+
+        head_dim = model_config.hf_config.decoder.head_dim
+        if get_flash_attn_version(head_size=head_dim) is None:
+            # Without FlashAttention, the merged attention falls back to a
+            # PyTorch implementation that cannot be captured in CUDA graphs.
+            logger.warning(
+                "FlashAttention is unavailable on this GPU; running T5Gemma2 "
+                "in eager mode with its PyTorch attention, which is slower."
+            )
+            model_config.enforce_eager = True
+
+
 class UnlimitedOCRForCausalLMConfig(VerifyAndUpdateConfig):
     @staticmethod
     def verify_and_update_config(vllm_config: "VllmConfig") -> None:
@@ -1255,6 +1277,7 @@ MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "Qwen4ExpForCausalLM": Qwen4ExpForCausalLMConfig,
     "Qwen4ExpForConditionalGeneration": (Qwen4ExpForConditionalGenerationConfig),
     "Qwen4ExpMTP": Qwen4ExpMTPConfig,
+    "T5Gemma2ForConditionalGeneration": T5Gemma2ForConditionalGenerationConfig,
     "UnlimitedOCRForCausalLM": UnlimitedOCRForCausalLMConfig,
     "VoyageQwen3BidirectionalEmbedModel": VoyageQwen3BidirectionalEmbedModelConfig,
     "XLMRobertaModel": JinaRobertaModelConfig,

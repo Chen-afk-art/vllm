@@ -114,7 +114,8 @@ def run_test(
         MODEL,
         dtype=dtype,
         max_model_len=2048,
-        limit_mm_per_prompt={"image": 1},
+        # Text-only runs disable images, which also skips the vision tower.
+        limit_mm_per_prompt={"image": 0 if images is None else len(images)},
     ) as vllm_model:
         vllm_outputs = vllm_model.generate_greedy_logprobs(
             prompts, max_tokens, num_logprobs=num_logprobs, images=images

@@ -52,6 +52,7 @@ from transformers.models.t5gemma2 import (
 )
 
 from vllm.config import CacheConfig, VllmConfig
+from vllm.config.compilation import CUDAGraphMode
 from vllm.config.multimodal import MultiModalDummyOptions
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
@@ -87,7 +88,7 @@ from vllm.multimodal.processing import (
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
-from vllm.v1.attention.backend import AttentionType
+from vllm.v1.attention.backend import AttentionBackend, AttentionType
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 
 from .gemma3 import Gemma3MLP
@@ -100,8 +101,12 @@ from .interfaces import MultiModalEmbeddings, SupportsMultiModal
 from .siglip import SiglipVisionModel
 from .utils import AutoWeightsLoader, WeightsMapper, extract_layer_index, maybe_prefix
 
-# Keyword arguments of the single multimodal item that carries the encoder
-# input of one request (see `T5Gemma2MultiModalProcessor._pack_encoder_input`).
+# The encoder input of one request (its token IDs and all of its images) is
+# packed into one multimodal item of this modality, which users never pass
+# themselves (see `T5Gemma2MultiModalProcessor._pack_encoder_input`). Keeping
+# it apart from "image" lets `limit_mm_per_prompt={"image": 0}` skip the
+# vision tower for text-only use.
+_ENCODER_MODALITY = "text"
 _ENCODER_INPUT_IDS = "encoder_input_ids"
 _PIXEL_VALUES = "pixel_values"
 
@@ -118,14 +123,28 @@ class T5Gemma2ProcessingInfo(Gemma3ProcessingInfo):
     def get_hf_processor(self, **kwargs: object) -> Gemma3Processor:
         return self.ctx.get_hf_processor(Gemma3Processor, **kwargs)
 
+    def get_supported_mm_limits(self) -> Mapping[str, int | None]:
+        return {"image": None, _ENCODER_MODALITY: 1}
+
     def get_mm_max_tokens_per_item(
         self,
         seq_len: int,
         mm_counts: Mapping[str, int],
     ) -> Mapping[str, int]:
-        # The single encoder item spans the whole encoder prompt, so its size
-        # is bounded by the model length rather than by the number of images.
-        return {"image": seq_len}
+        # Only the encoder item reaches the encoder; images are part of it.
+        # Its size is bounded by the model length.
+        return {_ENCODER_MODALITY: seq_len}
+
+    def get_image_seq_len(self) -> int:
+        """Number of encoder tokens of the largest image after expansion."""
+        image_size = self.get_image_size_with_most_features()
+        repl = self.get_image_repl(
+            image_width=image_size.width,
+            image_height=image_size.height,
+            processor=self.get_hf_processor(),
+            mm_kwargs={},
+        )
+        return len(repl.full)
 
     def get_image_size_with_most_features(self) -> ImageSize:
         processor = self.get_hf_processor()
@@ -169,9 +188,10 @@ class T5Gemma2MultiModalProcessor(
 
     The image placeholders are expanded with the Gemma 3 rules (inherited from
     `Gemma3MultiModalProcessor`). Afterwards, the expanded encoder token IDs
-    and the pixel values of every image are packed into a single "image" item
-    whose placeholder covers the whole encoder prompt. The decoder prompt
-    starts empty, so the renderer only adds the decoder start token.
+    and the pixel values of every image are packed into a single item of
+    `_ENCODER_MODALITY` whose placeholder covers the whole encoder prompt.
+    The decoder prompt starts empty, so the renderer only adds the decoder
+    start token.
     """
 
     # The encoder consumes the prompt tokens, so text-only prompts must still
@@ -198,23 +218,19 @@ class T5Gemma2MultiModalProcessor(
         mm_counts: Mapping[str, int],
         mm_options: MultiModalDummyOptions,
     ) -> ProcessorInputs:
+        image_seq_len = self.info.get_image_seq_len()
+        if "image" not in mm_counts and mm_counts.get(_ENCODER_MODALITY, 0):
+            # Profiling the encoder item: the worst case holds as many images
+            # as are allowed and fit into the encoder sequence.
+            max_images = self.info.allowed_mm_limits.get("image", 0)
+            mm_counts = {"image": min(max_images, seq_len // image_seq_len)}
         inputs = super().get_dummy_inputs(seq_len, mm_counts, mm_options)
 
         # Pad the dummy encoder prompt so that the profiled encoder item has
         # the maximum encoder length after the image tokens are expanded.
+        # Each image placeholder token is replaced by `image_seq_len` tokens.
         num_images = mm_counts.get("image", 0)
-        if num_images:
-            image_size = self.info.get_image_size_with_most_features()
-            repl = self.info.get_image_repl(
-                image_width=image_size.width,
-                image_height=image_size.height,
-                processor=self.info.get_hf_processor(),
-                mm_kwargs={},
-            )
-            # Each image placeholder token is replaced by `len(repl.full)`.
-            expanded_len = len(inputs.prompt) + num_images * (len(repl.full) - 1)
-        else:
-            expanded_len = len(inputs.prompt)
+        expanded_len = len(inputs.prompt) + num_images * (image_seq_len - 1)
 
         pad_token_id = self.info.get_hf_config().pad_token_id or 0
         inputs.prompt = inputs.prompt + [pad_token_id] * max(0, seq_len - expanded_len)
@@ -293,10 +309,12 @@ class T5Gemma2MultiModalProcessor(
 
         packed: MultiModalInput = {
             **encoder_inputs,
-            "mm_kwargs": MultiModalKwargsItems({"image": [item]}),
-            "mm_hashes": {"image": [mm_hash]},
+            "mm_kwargs": MultiModalKwargsItems({_ENCODER_MODALITY: [item]}),
+            "mm_hashes": {_ENCODER_MODALITY: [mm_hash]},
             "mm_placeholders": {
-                "image": [PlaceholderRange(offset=0, length=len(prompt_token_ids))]
+                _ENCODER_MODALITY: [
+                    PlaceholderRange(offset=0, length=len(prompt_token_ids))
+                ]
             },
         }
         return packed
@@ -317,20 +335,20 @@ class _EncoderAttnMetadata:
 
 
 def _get_fa_version(head_dim: int) -> int | None:
-    """FlashAttention version for the T5Gemma2 kernels, `None` off CUDA."""
+    """FlashAttention version for the kernels that T5Gemma2 calls directly.
+
+    Returns `None` when FlashAttention is unavailable (off CUDA, or on GPUs
+    older than compute capability 8.0); the PyTorch path is used then.
+    """
     if not current_platform.is_cuda():
         return None
 
     from vllm.v1.attention.backends.fa_utils import get_flash_attn_version
 
     fa_version = get_flash_attn_version(head_size=head_dim)
-    if fa_version is None:
-        # The PyTorch fallback is not CUDA graph safe, so do not silently
-        # fall back to it on GPUs.
-        raise NotImplementedError(
-            "T5Gemma2 requires FlashAttention on CUDA (compute capability 8.0+)."
-        )
-    return fa_version
+    # These calls have no FA4-specific handling (e.g. its head_dim=256
+    # kernel on Blackwell), and FA2 runs on the same KV cache layout.
+    return 2 if fa_version == 4 else fa_version
 
 
 def _encoder_attention(
@@ -420,19 +438,21 @@ def _flash_attn_with_lse(
     query: torch.Tensor,
     kv_cache: torch.Tensor,
     attn_metadata,
+    fa_version: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Paged attention through vLLM's FlashAttention backend, returning LSE."""
+    """Paged attention on a FlashAttention-backend cache, returning LSE."""
     from vllm.utils.torch_utils import canonicalize_singleton_dim_strides
     from vllm.v1.attention.backends.fa_utils import flash_attn_varlen_func
     from vllm.v1.attention.backends.flash_attn import FlashAttentionImpl
 
     impl = cast(FlashAttentionImpl, layer.impl)
-    if getattr(impl, "fa4_hd256", False):
-        raise NotImplementedError(
-            "T5Gemma2 merged attention does not support the FA4 head_dim=256 "
-            "kernel yet. Please pass `--attention-config.flash_attn_version=2`."
-        )
-    assert impl.vllm_flash_attn_version is not None
+    # The metadata builder schedules ahead of time for the backend's own FA
+    # version only.
+    scheduler_metadata = (
+        attn_metadata.scheduler_metadata
+        if fa_version == impl.vllm_flash_attn_version
+        else None
+    )
     causal = attn_metadata.causal
     assert isinstance(causal, bool), "T5Gemma2 does not support dynamic causal"
 
@@ -459,8 +479,8 @@ def _flash_attn_with_lse(
         block_table=attn_metadata.block_table,
         softcap=impl.logits_soft_cap,
         return_softmax_lse=True,
-        scheduler_metadata=attn_metadata.scheduler_metadata,
-        fa_version=impl.vllm_flash_attn_version,
+        scheduler_metadata=scheduler_metadata,
+        fa_version=fa_version,
         num_splits=attn_metadata.max_num_splits,
     )
     return out, lse
@@ -544,7 +564,7 @@ def t5gemma2_merged_attention(
     output: torch.Tensor,
     self_layer_name: str,
     cross_layer_name: str,
-    use_flash_attn: bool,
+    fa_version: int | None,
     scale: float,
     softcap: float | None,
 ) -> None:
@@ -561,8 +581,8 @@ def t5gemma2_merged_attention(
         output: [num_tokens, num_heads, head_dim], written in place.
         self_layer_name: Layer that owns the decoder self-attention cache.
         cross_layer_name: Layer that owns the cross-attention cache.
-        use_flash_attn: Use the FlashAttention kernels and cache layout
-            instead of the PyTorch reference implementation.
+        fa_version: FlashAttention version to use on FlashAttention-backend
+            caches, or `None` for the PyTorch reference implementation.
         scale: Softmax scale, used by the PyTorch implementation.
         softcap: Attention logit soft cap, used by the PyTorch implementation.
 
@@ -583,7 +603,7 @@ def t5gemma2_merged_attention(
 
     # 1. Store the new K/V. The cross-attention metadata builder computes the
     #    slots of the encoder tokens and stores them on the metadata.
-    if use_flash_attn:
+    if fa_version is not None:
         from vllm.v1.attention.backends.flash_attn import FlashAttentionImpl
 
         if self_slots is not None:
@@ -607,12 +627,12 @@ def t5gemma2_merged_attention(
             )
 
     # 2. Attend to both caches separately, keeping the softmax denominators.
-    if use_flash_attn:
+    if fa_version is not None:
         self_out, self_lse = _flash_attn_with_lse(
-            self_layer, query, self_kv_cache, self_metadata
+            self_layer, query, self_kv_cache, self_metadata, fa_version
         )
         cross_out, cross_lse = _flash_attn_with_lse(
-            cross_layer, query, cross_kv_cache, cross_metadata
+            cross_layer, query, cross_kv_cache, cross_metadata, fa_version
         )
     else:
         self_out, self_lse = _paged_attention_with_lse_torch(
@@ -753,9 +773,6 @@ class T5Gemma2EncoderAttention(T5Gemma2AttentionBase):
         else:
             self.window = (-1, -1)
         self.fa_version = _get_fa_version(self.head_dim)
-        if self.fa_version == 4:
-            # The varlen encoder call has no FA4-specific handling.
-            self.fa_version = 2
 
     def forward(
         self,
@@ -784,14 +801,21 @@ class T5Gemma2MergedAttention(T5Gemma2AttentionBase):
         super().__init__(config, quant_config, prefix)
         self.softcap = config.attn_logit_softcapping
 
-        # On CUDA, both caches must use the FlashAttention layout and kernels,
-        # because `_flash_attn_with_lse` calls the kernels directly.
-        self.use_flash_attn = _get_fa_version(self.head_dim) is not None
-        attn_backend = None
-        if self.use_flash_attn:
+        # With FlashAttention, both caches must use its backend, because
+        # `_flash_attn_with_lse` calls the kernels on them directly. Without
+        # it, the PyTorch path reads and writes the caches itself, so any
+        # backend works; on CUDA we pick Triton, which supports every type
+        # of attention layer.
+        self.fa_version = _get_fa_version(self.head_dim)
+        attn_backend: type[AttentionBackend] | None = None
+        if self.fa_version is not None:
             from vllm.v1.attention.backends.flash_attn import FlashAttentionBackend
 
             attn_backend = FlashAttentionBackend
+        elif current_platform.is_cuda():
+            from vllm.v1.attention.backends.triton_attn import TritonAttentionBackend
+
+            attn_backend = TritonAttentionBackend
 
         # The two layers below only own a KV cache each. Their `forward` is
         # never called; `t5gemma2_merged_attention` reads both caches.
@@ -856,7 +880,7 @@ class T5Gemma2MergedAttention(T5Gemma2AttentionBase):
             attn_output,
             self.attn.layer_name,
             self.cross_attn.layer_name,
-            self.use_flash_attn,
+            self.fa_version,
             self.scaling,
             self.softcap,
         )
@@ -1179,11 +1203,21 @@ class T5Gemma2ForConditionalGeneration(nn.Module, SupportsMultiModal):
         self.config = config
 
         mm_config = vllm_config.model_config.get_multimodal_config()
-        if mm_config.get_limit_per_prompt("image") == 0:
+        if mm_config.get_limit_per_prompt(_ENCODER_MODALITY) == 0:
             raise ValueError(
-                "T5Gemma2 passes every encoder prompt, including text-only ones, "
-                "through the 'image' modality, so `limit_mm_per_prompt` must "
-                "allow at least one image."
+                "T5Gemma2 runs its encoder through the multimodal encoder path, "
+                f"so neither `language_model_only` nor a zero limit for the "
+                f"{_ENCODER_MODALITY!r} modality is supported. Use "
+                "`limit_mm_per_prompt={'image': 0}` for text-only inputs."
+            )
+        if (
+            current_platform.is_cuda()
+            and _get_fa_version(config.decoder.head_dim) is None
+            and vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+        ):
+            raise ValueError(
+                "T5Gemma2 needs FlashAttention for CUDA graphs on this GPU; "
+                "pass `enforce_eager=True`."
             )
 
         with self._mark_composite_model(

@@ -92,6 +92,13 @@ MM_DATA_PATCHES = {
     "glmasr": glmasr_patch_mm_data,
 }
 
+# Modalities whose items the processor creates itself, so users (and this
+# test) never pass data for them.
+_PROCESSOR_CREATED_MODALITIES = {
+    # The packed encoder input of T5Gemma2.
+    "t5gemma2": {"text"},
+}
+
 _XPU_EXCLUDED_MODEL_IDS = {
     "baidu/Unlimited-OCR",
     "mistralai/Mistral-Large-3-675B-Instruct-2512-NVFP4",
@@ -350,6 +357,9 @@ def _test_processing_correctness(
         modality: 3 if limit is None else limit
         for modality, limit in supported_mm_limits.items()
     }
+    processor_created_modalities = _PROCESSOR_CREATED_MODALITIES.get(
+        model_config.hf_config.model_type, set()
+    )
 
     def _to_dummy_options(modality: str, count: int) -> BaseDummyOptions:
         if modality == "video":
@@ -404,6 +414,7 @@ def _test_processing_correctness(
                 for _ in range(rng.randint(limit + 1))
             ]
             for k, limit in limit_mm_per_prompt_ints.items()
+            if k not in processor_created_modalities
         }
 
         # Drop unnecessary keys and test single -> multi conversion

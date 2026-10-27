@@ -524,33 +524,41 @@ def _write_kv_cache_torch(
 def _paged_attention_with_lse_torch(
     query: torch.Tensor,
     kv_cache: torch.Tensor,
-    attn_metadata,
+    query_start_loc: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    causal: bool,
     scale: float,
     sliding_window: int | None,
     softcap: float | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Paged attention for platforms without FlashAttention.
 
-    Returns the output `[T, H, D]` and the LSE `[H, T]`; padded tokens get a
-    zero output and an LSE of -inf. Requests are padded to common lengths and
-    computed together, with single-token queries (decodes) batched apart from
-    the rest so that one long query does not pad all of them.
+    The requests are given as in the attention metadata: `query_start_loc`
+    `[R + 1]`, `seq_lens` `[R]` and `block_table` `[R, blocks]`. Returns the
+    output `[T, H, D]` and the LSE `[H, T]`; padded tokens get a zero output
+    and an LSE of -inf. Requests are padded to common lengths and computed
+    together, with single-token queries (decodes) batched apart from the rest
+    so that one long query does not pad all of them.
     """
     num_tokens, num_heads, _ = query.shape
     out = torch.zeros_like(query)
     lse = torch.full(
         (num_heads, num_tokens), float("-inf"), dtype=torch.float32, device=query.device
     )
-    query_start_loc = attn_metadata.query_start_loc
-    num_reqs = attn_metadata.seq_lens.shape[0]
-    q_lens = query_start_loc[1 : num_reqs + 1] - query_start_loc[:num_reqs]
+    num_reqs = seq_lens.shape[0]
+    starts = query_start_loc[:num_reqs]
+    q_lens = query_start_loc[1 : num_reqs + 1] - starts
     for reqs in ((q_lens == 1).nonzero()[:, 0], (q_lens > 1).nonzero()[:, 0]):
         if reqs.numel() > 0:
             _batched_attention_with_lse_torch(
                 query,
                 kv_cache,
-                attn_metadata,
-                reqs,
+                starts[reqs],
+                q_lens[reqs],
+                seq_lens[reqs],
+                block_table[reqs],
+                causal,
                 scale,
                 sliding_window,
                 softcap,
@@ -563,30 +571,31 @@ def _paged_attention_with_lse_torch(
 def _batched_attention_with_lse_torch(
     query: torch.Tensor,
     kv_cache: torch.Tensor,
-    attn_metadata,
-    reqs: torch.Tensor,
+    starts: torch.Tensor,
+    q_lens: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    causal: bool,
     scale: float,
     sliding_window: int | None,
     softcap: float | None,
     out: torch.Tensor,
     lse: torch.Tensor,
 ) -> None:
-    """Write the attention of requests `reqs` into `out` and `lse`."""
+    """Write the attention of the given requests into `out` and `lse`."""
     _, num_heads, head_dim = query.shape
     _, num_kv_heads, block_size, _ = kv_cache.shape
     group = num_heads // num_kv_heads
     device = query.device
+    num_reqs = starts.shape[0]
 
-    starts = attn_metadata.query_start_loc[reqs]
-    q_lens = attn_metadata.query_start_loc[reqs + 1] - starts
-    seq_lens = attn_metadata.seq_lens[reqs]
     max_q, max_kv = int(q_lens.max()), int(seq_lens.max())
     if max_kv == 0:
         return
 
     # Gather straight into [Hkv, R, max_kv, 2D], the batch layout of the
     # matmuls below, so that K and V are copied once.
-    blocks = attn_metadata.block_table[reqs, : cdiv(max_kv, block_size)]
+    blocks = block_table[:, : cdiv(max_kv, block_size)]
     kv = kv_cache.transpose(0, 1)[:, blocks].flatten(2, 3)[:, :, :max_kv].float()
     k, v = kv[..., :head_dim], kv[..., head_dim:]
 
@@ -595,13 +604,11 @@ def _batched_attention_with_lse_torch(
         q = query[tokens].float().unsqueeze(1)
     else:
         # Token t of the batch is query `q_idx[t]` of request `req_idx[t]`.
-        req_idx = torch.repeat_interleave(
-            torch.arange(len(reqs), device=device), q_lens
-        )
+        req_idx = torch.repeat_interleave(torch.arange(num_reqs, device=device), q_lens)
         q_idx = torch.arange(len(req_idx), device=device)
         q_idx -= (q_lens.cumsum(0) - q_lens)[req_idx]
         tokens = starts[req_idx] + q_idx
-        q = query.new_zeros(len(reqs), max_q, num_heads, head_dim, dtype=torch.float32)
+        q = query.new_zeros(num_reqs, max_q, num_heads, head_dim, dtype=torch.float32)
         q[req_idx, q_idx] = query[tokens].float()
 
     # Query head h reads KV head h // group. Folding the group into the query
@@ -615,7 +622,7 @@ def _batched_attention_with_lse_torch(
 
     k_pos = torch.arange(max_kv, device=device)
     mask = k_pos[None, None, :] < seq_lens[:, None, None]
-    if attn_metadata.causal:
+    if causal:
         # The queries are the last `q_len` tokens of the sequence.
         q_pos = (seq_lens - q_lens)[:, None] + torch.arange(max_q, device=device)
         mask = mask & (k_pos[None, None, :] <= q_pos[..., None])
@@ -720,13 +727,24 @@ def t5gemma2_merged_attention(
         self_out, self_lse = _paged_attention_with_lse_torch(
             query,
             self_kv_cache,
-            self_metadata,
+            self_metadata.query_start_loc,
+            self_metadata.seq_lens,
+            self_metadata.block_table,
+            bool(self_metadata.causal),
             scale,
             self_layer.sliding_window,
             softcap,
         )
         cross_out, cross_lse = _paged_attention_with_lse_torch(
-            query, cross_kv_cache, cross_metadata, scale, None, softcap
+            query,
+            cross_kv_cache,
+            cross_metadata.query_start_loc,
+            cross_metadata.seq_lens,
+            cross_metadata.block_table,
+            bool(cross_metadata.causal),
+            scale,
+            None,
+            softcap,
         )
 
     # 3. softmax([s1, s2]) @ [v1; v2] == LSE-weighted mix of both outputs.

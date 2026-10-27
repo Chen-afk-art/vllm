@@ -730,10 +730,15 @@ Some models are supported only via the [Transformers modeling backend](#transfor
     image and video only.
 
 !!! note
-    For `T5Gemma2ForConditionalGeneration`, LoRA adapters apply to the text encoder
-    and the decoder; LoRA weights of the vision tower are ignored. vLLM turns on
-    `enable_tower_connector_lora` automatically, because the text encoder runs on
-    the multimodal encoder path.
+    For `T5Gemma2ForConditionalGeneration`:
+    - The prompt and its images are the encoder input. The decoder starts from
+      `<bos>` unless an explicit `decoder_prompt` is given.
+    - For text-only use, set `--limit-mm-per-prompt '{"image": 0}'`, which skips
+      loading the vision tower. `--language-model-only` is not supported, because
+      the text encoder runs on the multimodal encoder path.
+    - LoRA adapters apply to the text encoder and the decoder; LoRA weights of the
+      vision tower are ignored. vLLM turns on `enable_tower_connector_lora`
+      automatically.
 
 !!! note
     The official `openbmb/MiniCPM-V-2` doesn't work yet, so we need to use a fork (`HwwwH/MiniCPM-V-2`) for now.

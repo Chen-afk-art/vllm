@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from contextlib import nullcontext
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -68,14 +67,16 @@ def test_merged_attention_is_one_softmax(sliding_window: int | None) -> None:
 
     def partial(keys, values, seq_lens, causal, window):
         kv_cache, block_table = _make_paged_kv(keys, values, block_size)
-        metadata = SimpleNamespace(
-            query_start_loc=query_start_loc,
-            seq_lens=torch.tensor(seq_lens),
-            block_table=block_table,
-            causal=causal,
-        )
         return _paged_attention_with_lse_torch(
-            query, kv_cache, metadata, scale, window, softcap=None
+            query,
+            kv_cache,
+            query_start_loc,
+            torch.tensor(seq_lens),
+            block_table,
+            causal,
+            scale,
+            window,
+            softcap=None,
         )
 
     self_out, self_lse = partial(self_k, self_v, dec_lens, True, sliding_window)

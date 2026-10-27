@@ -529,45 +529,112 @@ def _paged_attention_with_lse_torch(
     sliding_window: int | None,
     softcap: float | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Reference paged attention for platforms without FlashAttention."""
-    num_tokens, num_heads, head_dim = query.shape
-    _, num_kv_heads, block_size, _ = kv_cache.shape
-    causal = bool(attn_metadata.causal)
+    """Paged attention for platforms without FlashAttention.
 
+    Returns the output `[T, H, D]` and the LSE `[H, T]`; padded tokens get a
+    zero output and an LSE of -inf. Requests are padded to common lengths and
+    computed together, with single-token queries (decodes) batched apart from
+    the rest so that one long query does not pad all of them.
+    """
+    num_tokens, num_heads, _ = query.shape
     out = torch.zeros_like(query)
     lse = torch.full(
         (num_heads, num_tokens), float("-inf"), dtype=torch.float32, device=query.device
     )
-    query_start_loc = attn_metadata.query_start_loc.tolist()
-    seq_lens = attn_metadata.seq_lens.tolist()
-    for i, kv_len in enumerate(seq_lens):
-        q_start, q_end = query_start_loc[i], query_start_loc[i + 1]
-        if q_start == q_end or kv_len == 0:
-            continue
-        blocks = attn_metadata.block_table[i, : cdiv(kv_len, block_size)]
-        # [num_blocks, H, N, 2D] -> [num_blocks * N, H, 2D] -> keep kv_len rows
-        kv = kv_cache[blocks].transpose(1, 2).flatten(0, 1)[:kv_len].float()
-        k = kv[..., :head_dim].repeat_interleave(num_heads // num_kv_heads, dim=1)
-        v = kv[..., head_dim:].repeat_interleave(num_heads // num_kv_heads, dim=1)
-
-        q = query[q_start:q_end].float()
-        scores = torch.einsum("qhd,khd->hqk", q, k) * scale
-        if softcap:
-            scores = softcap * torch.tanh(scores / softcap)
-        if causal:
-            # The queries are the last `q_len` tokens of the sequence.
-            q_pos = torch.arange(kv_len - (q_end - q_start), kv_len, device=q.device)
-            k_pos = torch.arange(kv_len, device=q.device)
-            mask = k_pos[None, :] <= q_pos[:, None]
-            if sliding_window is not None:
-                mask &= k_pos[None, :] > q_pos[:, None] - sliding_window
-            scores = scores.masked_fill(~mask, float("-inf"))
-
-        lse_i = torch.logsumexp(scores, dim=-1)  # [H, q_len]
-        probs = torch.exp(scores - lse_i[..., None])
-        out[q_start:q_end] = torch.einsum("hqk,khd->qhd", probs, v).to(out.dtype)
-        lse[:, q_start:q_end] = lse_i
+    query_start_loc = attn_metadata.query_start_loc
+    num_reqs = attn_metadata.seq_lens.shape[0]
+    q_lens = query_start_loc[1 : num_reqs + 1] - query_start_loc[:num_reqs]
+    for reqs in ((q_lens == 1).nonzero()[:, 0], (q_lens > 1).nonzero()[:, 0]):
+        if reqs.numel() > 0:
+            _batched_attention_with_lse_torch(
+                query,
+                kv_cache,
+                attn_metadata,
+                reqs,
+                scale,
+                sliding_window,
+                softcap,
+                out,
+                lse,
+            )
     return out, lse
+
+
+def _batched_attention_with_lse_torch(
+    query: torch.Tensor,
+    kv_cache: torch.Tensor,
+    attn_metadata,
+    reqs: torch.Tensor,
+    scale: float,
+    sliding_window: int | None,
+    softcap: float | None,
+    out: torch.Tensor,
+    lse: torch.Tensor,
+) -> None:
+    """Write the attention of requests `reqs` into `out` and `lse`."""
+    _, num_heads, head_dim = query.shape
+    _, num_kv_heads, block_size, _ = kv_cache.shape
+    group = num_heads // num_kv_heads
+    device = query.device
+
+    starts = attn_metadata.query_start_loc[reqs]
+    q_lens = attn_metadata.query_start_loc[reqs + 1] - starts
+    seq_lens = attn_metadata.seq_lens[reqs]
+    max_q, max_kv = int(q_lens.max()), int(seq_lens.max())
+    if max_kv == 0:
+        return
+
+    # Gather straight into [Hkv, R, max_kv, 2D], the batch layout of the
+    # matmuls below, so that K and V are copied once.
+    blocks = attn_metadata.block_table[reqs, : cdiv(max_kv, block_size)]
+    kv = kv_cache.transpose(0, 1)[:, blocks].flatten(2, 3)[:, :, :max_kv].float()
+    k, v = kv[..., :head_dim], kv[..., head_dim:]
+
+    if max_q == 1:
+        tokens = starts
+        q = query[tokens].float().unsqueeze(1)
+    else:
+        # Token t of the batch is query `q_idx[t]` of request `req_idx[t]`.
+        req_idx = torch.repeat_interleave(
+            torch.arange(len(reqs), device=device), q_lens
+        )
+        q_idx = torch.arange(len(req_idx), device=device)
+        q_idx -= (q_lens.cumsum(0) - q_lens)[req_idx]
+        tokens = starts[req_idx] + q_idx
+        q = query.new_zeros(len(reqs), max_q, num_heads, head_dim, dtype=torch.float32)
+        q[req_idx, q_idx] = query[tokens].float()
+
+    # Query head h reads KV head h // group. Folding the group into the query
+    # rows, [Hkv, R, group * max_q, D], avoids expanding K and V per group.
+    q = q.unflatten(2, (num_kv_heads, group)).permute(2, 0, 3, 1, 4)
+    shape = q.shape[:-1]  # [Hkv, R, group, max_q]
+
+    scores = (q.flatten(2, 3) @ k.transpose(-1, -2)).view(*shape, max_kv) * scale
+    if softcap:
+        scores = softcap * torch.tanh(scores / softcap)
+
+    k_pos = torch.arange(max_kv, device=device)
+    mask = k_pos[None, None, :] < seq_lens[:, None, None]
+    if attn_metadata.causal:
+        # The queries are the last `q_len` tokens of the sequence.
+        q_pos = (seq_lens - q_lens)[:, None] + torch.arange(max_q, device=device)
+        mask = mask & (k_pos[None, None, :] <= q_pos[..., None])
+        if sliding_window is not None:
+            mask = mask & (k_pos[None, None, :] > q_pos[..., None] - sliding_window)
+    scores = scores.masked_fill(~mask[:, None], float("-inf"))
+
+    lse_pad = torch.logsumexp(scores, dim=-1)  # [Hkv, R, group, max_q]
+    # Rows without keys have an LSE of -inf; keep their probabilities at 0.
+    probs = torch.exp(scores - lse_pad.nan_to_num(neginf=0.0).unsqueeze(-1))
+    out_pad = (probs.flatten(2, 3) @ v).view(*shape, head_dim)
+    out_pad = out_pad.permute(1, 3, 0, 2, 4).flatten(2, 3)  # [R, max_q, H, D]
+    lse_pad = lse_pad.permute(1, 3, 0, 2).flatten(2, 3)  # [R, max_q, H]
+    if max_q == 1:
+        out[tokens] = out_pad[:, 0].to(out.dtype)
+        lse[:, tokens] = lse_pad[:, 0].T
+    else:
+        out[tokens] = out_pad[req_idx, q_idx].to(out.dtype)
+        lse[:, tokens] = lse_pad[req_idx, q_idx].T
 
 
 def t5gemma2_merged_attention(
